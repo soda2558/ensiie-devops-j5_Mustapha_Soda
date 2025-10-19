@@ -500,3 +500,240 @@ kubectl apply -f test-non-root.yaml
 - Forcer l’exécution non-root renforce la sécurité au niveau des conteneurs.
 
 ***
+
+***
+
+# Partie 4 : Network Policies
+
+## Ce que nous avons fait
+
+- Activation de l’addon ingress controller sur Minikube pour permettre la gestion du trafic entrant.  
+- Création de deux namespaces distincts : **backend** et **database**.  
+- Déploiement des deux services :
+  - backend (nginx)
+  - database (Redis)  
+- Mise en place de **Network Policies** afin de contrôler les flux réseau :
+  1. Autoriser le **backend** à communiquer avec la **database**
+  2. Autoriser **ingress-nginx** à accéder au **backend**
+  3. Bloquer toute autre communication inter-namespace.  
+- Vérifications par tests de connectivité réels avec `redis-cli` et `curl`,
+  confirmant que seules les connexions prévues sont autorisées.
+
+***
+
+## Commandes utilisées et explications
+
+1. **Activation de l’ingress sur Minikube :**
+
+```bash
+minikube addons enable ingress
+kubectl get pods -n ingress-nginx
+```
+
+2. **Création des namespaces isolés :**
+
+```bash
+kubectl create namespace backend
+kubectl create namespace database
+```
+
+3. **Déploiement de Redis dans le namespace database :**
+
+```bash
+kubectl apply -f redis-deployment.yaml -n database
+```
+
+Redis expose le port **6379** pour la communication.
+
+4. **Déploiement du backend nginx dans le namespace backend :**
+
+```bash
+kubectl apply -f backend-deployment.yaml -n backend
+```
+
+Backend écoute sur le port **80**.
+
+5. **Création des Network Policies :**
+
+```bash
+kubectl apply -f network-policies.yaml
+```
+
+Contenu du fichier :
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-backend-to-database
+  namespace: database
+spec:
+  podSelector:
+    matchLabels:
+      app: redis
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: backend
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-to-backend
+  namespace: backend
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          app.kubernetes.io/name: ingress-nginx
+```
+
+6. **Ajout du bon label au namespace backend (pour correspondre à la NetworkPolicy) :**
+
+```bash
+kubectl label namespace backend name=backend
+```
+
+7. **Test de la connectivité backend → Redis (autorisé) :**
+
+```bash
+kubectl exec -n backend backend-XXXX -- sh -c "apk add --no-cache redis && redis-cli -h redis.database.svc.cluster.local -p 6379 ping"
+```
+
+Résultat :
+```
+PONG
+```
+
+8. **Test de la connectivité ingress-nginx → backend (autorisé) :**
+
+```bash
+kubectl exec -n ingress-nginx ingress-nginx-controller-XXXX -- curl -s --connect-timeout 2 http://backend.backend.svc.cluster.local
+```
+
+Résultat :  
+Affichage de la page **Welcome to nginx!**
+
+9. **Test de la connectivité ingress-nginx → Redis (bloquée) :**
+
+```bash
+kubectl run -n ingress-nginx tmp-shell --rm -i --tty --image=alpine -- sh
+apk add --no-cache redis
+redis-cli -h redis.database.svc.cluster.local -p 6379 ping
+```
+
+Résultat :
+```
+Could not connect to Redis at redis.database.svc.cluster.local:6379: Operation timed out
+```
+
+***
+
+## Difficultés rencontrées
+
+| Difficulté | Solution |
+|-------------|-----------|
+| Network Policy ne fonctionnait pas au début | Ajout du label `name=backend` au namespace backend pour correspondre à la règle |
+| Erreur `resource mapping not found` à l’installation de Gatekeeper | Changement du `PodDisruptionBudget` en `policy/v1` |
+| Impossible d’accéder à Redis depuis backend au début | Correction du nom DNS → `redis.database.svc.cluster.local` |
+| Pod ingress-nginx sans permission d’installation de paquets | Création d’un pod temporaire `alpine` dans ingress-nginx pour tester la connectivité |
+
+***
+
+## Ce que nous avons appris
+
+- Une **Network Policy** permet de restreindre le trafic réseau entre pods, offrant une micro-segmentation fine.
+- Les **namespaceSelector** et **podSelector** doivent correspondre précisément aux labels définis.
+- L’importance d’ajouter les bons **labels** aux namespaces pour que les politiques soient effectives.
+- En l’absence de Network Policy, tout pod peut communiquer librement : l’isolation est donc un vrai mécanisme de sécurité.
+- Les tests manuels via `redis-cli` et `curl` sont essentiels pour confirmer la bonne mise en place.
+
+***
+
+## Conclusion
+
+| Flux | Statut |
+|------|--------|
+| backend → database (Redis) | Autorisé |
+| ingress-nginx → backend | Autorisé |
+| Autres flux inter-namespaces | Bloqués |
+
+
+# Partie 5 : Construire une matrice de risque
+
+## Ce que nous avons fait
+
+- Analyse détaillée de l'infrastructure Kubernetes mise en place (backend, Redis, ingress-nginx, Network Policies).
+- Identification des risques pertinents associés aux composants et à leur sécurité réseau.
+- Évaluation de chaque risque selon son impact et sa probabilité.
+- Construction d’une matrice de risque complète respectant le modèle requis.
+- Définition des actions de gestion de risque (remédiations) appropriées.
+- Priorisation des actions selon les critères P0 à P4, avec estimation de l’effort en jours/homme (JH).
+
+***
+
+## Définitions des niveaux d’impact et probabilité
+
+| Niveau     | Description Impact                                                                 | Description Probabilité                                                   |
+|------------|-----------------------------------------------------------------------------------|--------------------------------------------------------------------------|
+| Low        | Presque aucun effet négatif sur les fonctions ou ressources essentielles          | Très improbable ou contrôles efficaces en place                         |
+| Medium     | Effet limité, dégradation mineure pouvant être supportée                         | Peu probable, contrôles existants mais pas à toute épreuve              |
+| High       | Effet sévère, perte majeure de fonction, dommage important                        | Probable, risque significatif sans contrôle suffisant                   |
+| Critical   | Effet catastrophique, affectant largement l’organisation et ses missions          | Très probable, absence de contrôle ou contrôle inefficace               |
+
+***
+
+## Gestion du risque
+
+| Type       | Description                                                                      |
+|------------|----------------------------------------------------------------------------------|
+| Acceptation| Accepter le risque sans autre action                                            |
+| Mitigation | Réduire la probabilité ou l’impact par des mesures spécifiques                   |
+| Transfert  | Transférer le risque à un tiers (ex: sous-traitance)                            |
+| Évitement  | Supprimer la cause ou le scénario de risque                                     |
+
+***
+
+## Matrice de risque
+
+| ID | Risque                                         | Impact   | Probabilité | Gestion        | Remédiation associée                                 | Justification                         |
+|----|------------------------------------------------|----------|-------------|----------------|-----------------------------------------------------|-------------------------------------------------|
+| 1  | Accès non autorisé potentiel au backend via ingress-nginx | Medium   | Medium      | Mitigation     | Durcir les Network Policies ingress → backend       | Les règles réseau doivent être restrictives     |
+| 2  | Communication non chiffrée entre backend et Redis          | High     | Medium      | Mitigation     | Mise en place de TLS et monitoring réseau            | Sensibilité des données stockées                 |
+| 3  | Utilisation d’images non scannées vulnérables               | High     | High        | Mitigation     | Intégrer un scan d’images Docker dans pipeline CI/CD| Eviter l’exécution de vulnérabilités            |
+| 4  | Pods s’exécutant avec privilèges élevés (root)             | Critical | Medium      | Évitement      | Politiques OPA Gatekeeper pour restrictions non-root | Risques élévation privilèges et compromission  |
+| 5  | Configuration erronée des Network Policies                    | Critical | Low         | Mitigation     | Audits réguliers des policies réseau                  | Complexité des règles peut induire des failles  |
+
+***
+
+## Remédiations associées
+
+| Remédiation                              | Description                                        | Priorité | Estimation (JH) | Risque(s) couvert(s)                |
+|-----------------------------------------|--------------------------------------------------|----------|-----------------|-----------------------------------|
+| Durcir Network Policies ingress → backend | Restreindre strictement les flux depuis ingress-nginx vers backend | P1       | 2               | 1                                 |
+| Activer TLS sur communication backend → Redis | Sécuriser la communication avec chiffrement     | P0       | 3               | 2                                 |
+| Scans automatisés d’images Docker       | Intégrer la sécurité images dans pipeline CI/CD  | P0       | 4               | 3                                 |
+| Politiques OPA pour exécuter non-root  | Interdire l’exécution avec privilèges élevés     | P0       | 3               | 4                                 |
+| Audits réguliers Network Policies       | Examiner la configuration pour prévenir erreurs  | P2       | 2               | 5                                 |
+
+***
+
+## Analyse de la priorisation
+
+- Les remédiations P0 doivent être mises en place avant tout déploiement en production, car elles concernent la sécurité fondamentale des images et des privilèges pod.  
+- La remédiation P1 sur les règles réseau ingress est critique pour limiter l’exposition du backend aux flux externes.  
+- Les audits P2 sont à suivre pour maintenir la sécurité et corriger la configuration au fil du temps.
+
+
+
+
+
